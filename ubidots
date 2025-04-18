@@ -1,0 +1,152 @@
+import network
+import time
+import machine
+from machine import Pin
+from umqtt.simple import MQTTClient
+import urequests
+
+# ====== KONFIGURASI WIFI DAN UBIDOTS MQTT ======
+SSID_WIFI = "Infinix"
+PASSWORD_WIFI = "11030888"
+
+UBIDOTS_TOKEN = "BBUS-CLRebfBFFm9NMz00FjzKvbTfSzVZiz"
+UBIDOTS_MQTT_BROKER = "industrial.api.ubidots.com"
+UBIDOTS_DEVICE_LABEL = "code-warriors"
+
+# ====== KONFIGURASI TELEGRAM ======
+TELEGRAM_BOT_TOKEN = "7823737519:AAHvFVy7vm17M0uggRE_Jtt2XRm5_hyqyYs"  # Ganti dengan token bot kamu
+TELEGRAM_CHAT_ID = "5602708713"    # Ganti dengan chat ID kamu
+
+# ====== INISIALISASI PIN ======
+trigger = Pin(13, Pin.OUT)
+echo = Pin(12, Pin.IN)
+led = Pin(23, Pin.OUT)
+
+# ====== KONEKSI WIFI ======
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print("🔄 Menghubungkan ke WiFi...")
+        wlan.connect(SSID_WIFI, PASSWORD_WIFI)
+        timeout = 10
+        while not wlan.isconnected() and timeout > 0:
+            print("⏳ Menunggu koneksi... timeout:", timeout)
+            time.sleep(1)
+            timeout -= 1
+    if wlan.isconnected():
+        print("✅ Terhubung ke WiFi:", wlan.ifconfig()[0])
+        return True
+    else:
+        print("❌ Gagal konek WiFi!")
+        return False
+
+# ====== MENGHITUNG JARAK ULTRASONIK ======
+def get_distance():
+    trigger.value(0)
+    time.sleep_us(5)
+    trigger.value(1)
+    time.sleep_us(10)
+    trigger.value(0)
+
+    duration = machine.time_pulse_us(echo, 1, 30000)
+    if duration < 0:
+        print("⚠ Timeout sensor")
+        return None
+    distance = (duration * 0.0343) / 2
+    return round(distance, 2)
+
+def get_average_distance(samples=3):
+    readings = []
+    for _ in range(samples):
+        d = get_distance()
+        if d is not None and d < 300:  # Filter jika jarak terlalu jauh
+            readings.append(d)
+        time.sleep(0.05)
+    return sum(readings) / len(readings) if readings else None
+
+# ====== MQTT SETUP ======
+def connect_mqtt():
+    client = MQTTClient(
+        client_id="esp32", 
+        server=UBIDOTS_MQTT_BROKER,
+        user=UBIDOTS_TOKEN,
+        password=UBIDOTS_TOKEN,
+        port=1883
+    )
+    try:
+        client.connect()
+        print("✅ Terhubung ke MQTT Ubidots")
+    except Exception as e:
+        print("❌ Gagal konek MQTT:", e)
+    return client
+
+# ====== TELEGRAM NOTIFIKASI ======
+def send_telegram(message):
+    try:
+        url = "https://api.telegram.org/bot7823737519:AAHvFVy7vm17M0uggRE_Jtt2XRm5_hyqyYs/sendMessage"
+        payload = {
+            "chat_id": 5602708713,
+            "text": message
+        }
+        response = urequests.post(url, json=payload)
+        response.close()
+        print("📨 Notifikasi Telegram terkirim")
+    except Exception as e:
+        print("❌ Gagal kirim Telegram:", e)
+
+# ====== LOOP UTAMA ======
+if connect_wifi():
+    mqtt_client = connect_mqtt()
+    last_state = False
+    last_sent_level = -1
+
+    while True:
+        distance = get_average_distance()
+
+        if distance is not None:
+            print(f"📏 Jarak: {distance:.2f} cm")
+
+            # Logika LED
+            if distance < 10 and not last_state:
+                led.value(1)
+                last_state = True
+            elif distance >= 12 and last_state:
+                led.value(0)
+                last_state = False
+
+            # Kirim ke MQTT
+            topic = b"/v1.6/devices/" + UBIDOTS_DEVICE_LABEL.encode()
+            payload = '{{"jarak": {}}}'.format(distance)
+            try:
+                mqtt_client.publish(topic, payload)
+                print("📤 Data dikirim ke MQTT:", payload)
+            except Exception as e:
+                print("❌ Gagal publish MQTT:", e)
+
+            # Kirim notifikasi Telegram jika level berubah
+            message_list = [
+                "✅ Level NORMAL: Bendungan aman.",
+                "🔎 Level WASPADA: Air mulai naik.",
+                "⚠ Level SIAGA! Air mendekati batas tinggi.",
+                "🚨 Level KRITIS! Bendungan sangat penuh!"
+            ]
+
+            level = None  # Default
+            if distance < 5:
+                level = 3
+            elif distance < 10:
+                level = 2
+            elif distance < 20:
+                level = 1
+            elif distance < 300:
+                level = 0
+
+            if level is not None and 0 <= level < len(message_list):
+                if level != last_sent_level:
+                    message = f"{message_list[level]} ({distance:.2f} cm)"
+                    send_telegram(message)
+                    last_sent_level = level
+
+        print("-" * 30)
+        time.sleep(2)
